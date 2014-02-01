@@ -517,6 +517,8 @@ class MachineCom(object):
 		if ret == '':
 			#self._log("Recv: TIMEOUT")
 			return ''
+                elif ret == "PauseCura":
+                        self.setPause(true)
 		self._log("Recv: %s" % (unicode(ret, 'ascii', 'replace').encode('ascii', 'replace').rstrip()))
 		return ret
 	
