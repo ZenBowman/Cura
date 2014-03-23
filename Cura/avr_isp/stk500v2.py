@@ -1,3 +1,7 @@
+"""
+STK500v2 protocol implementation for programming AVR chips.
+The STK500v2 protocol is used by the ArduinoMega2560 and a few other Arduino platforms to load firmware.
+"""
 __copyright__ = "Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License"
 import os, struct, sys, time
 
@@ -30,6 +34,8 @@ class Stk500v2(ispBase.IspBase):
 		self.serial.setDTR(0)
 		time.sleep(0.2)
 
+		self.serial.flushInput()
+		self.serial.flushOutput()
 		self.sendMessage([1])
 		if self.sendMessage([0x10, 0xc8, 0x64, 0x19, 0x20, 0x00, 0x53, 0x03, 0xac, 0x53, 0x00, 0x00]) != [0x10, 0x00]:
 			self.close()
@@ -161,12 +167,14 @@ def portList():
 	return ret
 
 def runProgrammer(port, filename):
+	""" Run an STK500v2 program on serial port 'port' and write 'filename' into flash. """
 	programmer = Stk500v2()
 	programmer.connect(port = port)
 	programmer.programChip(intelHex.readHex(filename))
 	programmer.close()
 
 def main():
+	""" Entry point to call the stk500v2 programmer from the commandline. """
 	import threading
 	if sys.argv[1] == 'AUTO':
 		print portList()

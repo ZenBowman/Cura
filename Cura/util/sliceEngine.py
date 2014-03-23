@@ -1,3 +1,7 @@
+"""
+Slice engine communication.
+This module handles all communication with the slicing engine.
+"""
 __copyright__ = "Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License"
 import subprocess
 import time
@@ -14,13 +18,19 @@ import urllib2
 import hashlib
 import socket
 import struct
+import errno
 import cStringIO as StringIO
 
 from Cura.util import profile
+from Cura.util import pluginInfo
 from Cura.util import version
 from Cura.util import gcodeInterpreter
 
 def getEngineFilename():
+	"""
+		Finds and returns the path to the current engine executable. This is OS depended.
+	:return: The full path to the engine executable.
+	"""
 	if platform.system() == 'Windows':
 		if version.isDevVersion() and os.path.exists('C:/Software/Cura_SteamEngine/_bin/Release/Cura_SteamEngine.exe'):
 			return 'C:/Software/Cura_SteamEngine/_bin/Release/Cura_SteamEngine.exe'
@@ -31,15 +41,16 @@ def getEngineFilename():
 		return '/usr/bin/CuraEngine'
 	if os.path.isfile('/usr/local/bin/CuraEngine'):
 		return '/usr/local/bin/CuraEngine'
-	return os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'CuraEngine'))
-
-def getTempFilename():
-	warnings.simplefilter('ignore')
-	ret = os.tempnam(None, "Cura_Tmp")
-	warnings.simplefilter('default')
-	return ret
+	tempPath = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..', 'CuraEngine'))
+	if os.path.isdir(tempPath):
+		tempPath = os.path.join(tempPath,'CuraEngine')
+	return tempPath
 
 class EngineResult(object):
+	"""
+	Result from running the CuraEngine.
+	Contains the engine log, polygons retrieved from the engine, the GCode and some meta-data.
+	"""
 	def __init__(self):
 		self._engineLog = []
 		self._gcodeData = StringIO.StringIO()
@@ -73,6 +84,8 @@ class EngineResult(object):
 		return None
 
 	def getPrintTime(self):
+		if self._printTimeSeconds is None:
+			return ''
 		if int(self._printTimeSeconds / 60 / 60) < 1:
 			return '%d minutes' % (int(self._printTimeSeconds / 60) % 60)
 		if int(self._printTimeSeconds / 60 / 60) == 1:
@@ -89,11 +102,17 @@ class EngineResult(object):
 
 	def getGCode(self):
 		data = self._gcodeData.getvalue()
-		block0 = data[0:2048]
-		for k, v in self._replaceInfo.items():
-			v = (v + ' ' * len(k))[:len(k)]
-			block0 = block0.replace(k, v)
-		return block0 + data[2048:]
+		if len(self._replaceInfo) > 0:
+			block0 = data[0:2048]
+			for k, v in self._replaceInfo.items():
+				v = (v + ' ' * len(k))[:len(k)]
+				block0 = block0.replace(k, v)
+			return block0 + data[2048:]
+		return data
+
+	def setGCode(self, gcode):
+		self._gcodeData = StringIO.StringIO(gcode)
+		self._replaceInfo = {}
 
 	def addLog(self, line):
 		self._engineLog.append(line)
@@ -145,8 +164,14 @@ class EngineResult(object):
 			pass
 
 class Engine(object):
+	"""
+	Class used to communicate with the CuraEngine.
+	The CuraEngine is ran as a 2nd process and reports back information trough stderr.
+	GCode trough stdout and has a socket connection for polygon information and loading the 3D model into the engine.
+	"""
 	GUI_CMD_REQUEST_MESH = 0x01
 	GUI_CMD_SEND_POLYGONS = 0x02
+	GUI_CMD_FINISH_OBJECT = 0x03
 
 	def __init__(self, progressCallback):
 		self._process = None
@@ -169,20 +194,25 @@ class Engine(object):
 					break
 			else:
 				break
-		print 'Listening for engine communications on %d' % (self._serverPortNr)
-		self._serversocket.listen(1)
 		thread = threading.Thread(target=self._socketListenThread)
 		thread.daemon = True
 		thread.start()
 
 	def _socketListenThread(self):
+		self._serversocket.listen(1)
+		print 'Listening for engine communications on %d' % (self._serverPortNr)
 		while True:
-			sock, _ = self._serversocket.accept()
-			thread = threading.Thread(target=self._socketConnectionThread, args=(sock,))
-			thread.daemon = True
-			thread.start()
+			try:
+				sock, _ = self._serversocket.accept()
+				thread = threading.Thread(target=self._socketConnectionThread, args=(sock,))
+				thread.daemon = True
+				thread.start()
+			except socket.error, e:
+				if e.errno != errno.EINTR:
+					raise
 
 	def _socketConnectionThread(self, sock):
+		layerNrOffset = 0
 		while True:
 			try:
 				data = sock.recv(4)
@@ -200,6 +230,7 @@ class Engine(object):
 			elif cmd == self.GUI_CMD_SEND_POLYGONS:
 				cnt = struct.unpack('@i', sock.recv(4))[0]
 				layerNr = struct.unpack('@i', sock.recv(4))[0]
+				layerNr += layerNrOffset
 				z = struct.unpack('@i', sock.recv(4))[0]
 				z = float(z) / 1000.0
 				typeNameLen = struct.unpack('@i', sock.recv(4))[0]
@@ -223,6 +254,8 @@ class Engine(object):
 					polygon[:,:-1] = polygon2d
 					polygon[:,2] = z
 					polygons[typeName].append(polygon)
+			elif cmd == self.GUI_CMD_FINISH_OBJECT:
+				layerNrOffset = len(self._result._polygons)
 			else:
 				print "Unknown command on socket: %x" % (cmd)
 
@@ -257,10 +290,10 @@ class Engine(object):
 
 		extruderCount = max(extruderCount, profile.minimalExtruderCount())
 
-		commandList = [getEngineFilename(), '-vvv']
+		commandList = [getEngineFilename(), '-v', '-p']
 		for k, v in self._engineSettings(extruderCount).iteritems():
 			commandList += ['-s', '%s=%s' % (k, str(v))]
-		commandList += ['-g', '%d' % self._serverPortNr]
+		commandList += ['-g', '%d' % (self._serverPortNr)]
 		self._objCount = 0
 		engineModelData = []
 		hash = hashlib.sha512()
@@ -322,17 +355,17 @@ class Engine(object):
 				self._objCount += 1
 		modelHash = hash.hexdigest()
 		if self._objCount > 0:
-			self._modelData = engineModelData
-			self._thread = threading.Thread(target=self._watchProcess, args=(commandList, self._thread, modelHash))
+			self._thread = threading.Thread(target=self._watchProcess, args=(commandList, self._thread, engineModelData, modelHash))
 			self._thread.daemon = True
 			self._thread.start()
 
-	def _watchProcess(self, commandList, oldThread, modelHash):
+	def _watchProcess(self, commandList, oldThread, engineModelData, modelHash):
 		if oldThread is not None:
 			if self._process is not None:
 				self._process.terminate()
 			oldThread.join()
 		self._callback(-1.0)
+		self._modelData = engineModelData
 		try:
 			self._process = self._runEngineProcess(commandList)
 		except OSError:
@@ -342,6 +375,7 @@ class Engine(object):
 			self._process.terminate()
 
 		self._result = EngineResult()
+		self._result.addLog('Running: %s' % (' '.join(commandList)))
 		self._result.setHash(modelHash)
 		self._callback(0.0)
 
@@ -357,7 +391,7 @@ class Engine(object):
 		returnCode = self._process.wait()
 		logThread.join()
 		if returnCode == 0:
-			pluginError = None #profile.runPostProcessingPlugins(self._exportFilename)
+			pluginError = pluginInfo.runPostProcessingPlugins(self._result)
 			if pluginError is not None:
 				print pluginError
 				self._result.addLog(pluginError)
@@ -414,6 +448,7 @@ class Engine(object):
 			'filamentDiameter': int(profile.getProfileSettingFloat('filament_diameter') * 1000),
 			'filamentFlow': int(profile.getProfileSettingFloat('filament_flow')),
 			'extrusionWidth': int(profile.calculateEdgeWidth() * 1000),
+			'layer0extrusionWidth': int(profile.calculateEdgeWidth() * 1000),
 			'insetCount': int(profile.calculateLineCount()),
 			'downSkinCount': int(profile.calculateSolidLayerCount()) if profile.getProfileSetting('solid_bottom') == 'True' else 0,
 			'upSkinCount': int(profile.calculateSolidLayerCount()) if profile.getProfileSetting('solid_top') == 'True' else 0,
@@ -437,10 +472,11 @@ class Engine(object):
 			'retractionSpeed': int(profile.getProfileSettingFloat('retraction_speed')),
 			'retractionMinimalDistance': int(profile.getProfileSettingFloat('retraction_min_travel') * 1000),
 			'retractionAmountExtruderSwitch': int(profile.getProfileSettingFloat('retraction_dual_amount') * 1000),
+			'retractionZHop': int(profile.getProfileSettingFloat('retraction_hop') * 1000),
 			'minimalExtrusionBeforeRetraction': int(profile.getProfileSettingFloat('retraction_minimal_extrusion') * 1000),
 			'enableCombing': 1 if profile.getProfileSetting('retraction_combing') == 'True' else 0,
 			'multiVolumeOverlap': int(profile.getProfileSettingFloat('overlap_dual') * 1000),
-			'objectSink': int(profile.getProfileSettingFloat('object_sink') * 1000),
+			'objectSink': max(0, int(profile.getProfileSettingFloat('object_sink') * 1000)),
 			'minimalLayerTime': int(profile.getProfileSettingFloat('cool_min_layer_time')),
 			'minimalFeedrate': int(profile.getProfileSettingFloat('cool_min_feedrate')),
 			'coolHeadLift': 1 if profile.getProfileSetting('cool_head_lift') == 'True' else 0,
@@ -459,6 +495,8 @@ class Engine(object):
 		settings['fanFullOnLayerNr'] = (fanFullHeight - settings['initialLayerThickness'] - 1) / settings['layerThickness'] + 1
 		if settings['fanFullOnLayerNr'] < 0:
 			settings['fanFullOnLayerNr'] = 0
+		if profile.getProfileSetting('support_type') == 'Lines':
+			settings['supportType'] = 1
 
 		if profile.getProfileSettingFloat('fill_density') == 0:
 			settings['sparseInfillLineDistance'] = -1
@@ -500,6 +538,12 @@ class Engine(object):
 			settings['layerThickness'] = 1000
 		if profile.getMachineSetting('gcode_flavor') == 'UltiGCode':
 			settings['gcodeFlavor'] = 1
+		elif profile.getMachineSetting('gcode_flavor') == 'MakerBot':
+			settings['gcodeFlavor'] = 2
+		elif profile.getMachineSetting('gcode_flavor') == 'BFB':
+			settings['gcodeFlavor'] = 3
+		elif profile.getMachineSetting('gcode_flavor') == 'Mach3':
+			settings['gcodeFlavor'] = 4
 		if profile.getProfileSetting('spiralize') == 'True':
 			settings['spiralizeMode'] = 1
 		if profile.getProfileSetting('wipe_tower') == 'True' and extruderCount > 1:

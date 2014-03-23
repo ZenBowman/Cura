@@ -13,6 +13,9 @@ from optparse import OptionParser
 from Cura.util import profile
 
 def main():
+	"""
+	Main Cura entry point. Parses arguments, and starts GUI or slicing process depending on the arguments.
+	"""
 	parser = OptionParser(usage="usage: %prog [options] <filename>.stl")
 	parser.add_option("-i", "--ini", action="store", type="string", dest="profileini",
 		help="Load settings from a profile ini file")
@@ -24,8 +27,16 @@ def main():
 		help="Slice the given files instead of opening them in Cura")
 	parser.add_option("-o", "--output", action="store", type="string", dest="output",
 		help="path to write sliced file to")
+	parser.add_option("--serialCommunication", action="store", type="string", dest="serialCommunication",
+		help="Start commandline serial monitor")
 
 	(options, args) = parser.parse_args()
+
+	if options.serialCommunication:
+		from Cura import serialCommunication
+		port, baud = options.serialCommunication.split(':')
+		serialCommunication.startMonitor(port, baud)
+		return
 
 	print "load preferences from " + profile.getPreferencePath()
 	profile.loadPreferences(profile.getPreferencePath())
@@ -35,7 +46,7 @@ def main():
 	elif options.profileini is not None:
 		profile.loadProfile(options.profileini)
 	else:
-		profile.loadProfile(profile.getDefaultProfilePath())
+		profile.loadProfile(profile.getDefaultProfilePath(), True)
 
 	if options.printfile is not None:
 		from Cura.gui import printWindow
@@ -46,26 +57,25 @@ def main():
 		from Cura.util import meshLoader
 		import shutil
 
-		def commandlineProgressCallback(progress, ready):
-			if progress >= 0 and not ready:
-				print 'Preparing: %d%%' % (progress * 100)
+		def commandlineProgressCallback(progress):
+			if progress >= 0:
+				#print 'Preparing: %d%%' % (progress * 100)
+				pass
 		scene = objectScene.Scene()
 		scene.updateMachineDimensions()
-		slicer = sliceEngine.Slicer(commandlineProgressCallback)
+		engine = sliceEngine.Engine(commandlineProgressCallback)
 		for m in meshLoader.loadMeshes(args[0]):
 			scene.add(m)
-		slicer.runSlicer(scene)
-		slicer.wait()
-		profile.replaceGCodeTagsFromSlicer(slicer.getGCodeFilename(), slicer)
+		engine.runEngine(scene)
+		engine.wait()
 
-		if options.output:
-			shutil.copyfile(slicer.getGCodeFilename(), options.output)
-			print 'GCode file saved : %s' % options.output
-		else:
-			shutil.copyfile(slicer.getGCodeFilename(), args[0] + '.gcode')
-			print 'GCode file saved as: %s' % (args[0] + '.gcode')
+		if not options.output:
+			options.output = args[0] + '.gcode'
+		with open(options.output, "wb") as f:
+			f.write(engine.getResult().getGCode())
+		print 'GCode file saved : %s' % options.output
 
-		slicer.cleanup()
+		engine.cleanup()
 	else:
 		from Cura.gui import app
 		app.CuraApp(args).MainLoop()
